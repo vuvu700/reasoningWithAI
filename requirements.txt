@@ -1,0 +1,4 @@
+git+https://github.com/vuvu700/holo.git@dev
+attrs
+numpy
+torch
