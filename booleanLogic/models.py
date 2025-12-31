@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, random_split
 
-
+import time
 import attrs
 import numpy
 
@@ -27,19 +27,28 @@ class Results():
 def train_model(
         model:nn.Module, optimizer:torch.optim.Optimizer,
         criterion:"_Criterion", nbEpoches:int, device:torch.device,
-        train_dataloader:DataLoader, test_dataloader:DataLoader, 
-        history:list[tuple[Results, Results]]|None=None)->Results:
-    if history is None:
-        history = []
+        train_dataloader:DataLoader, test_dataloader:DataLoader,
+        timeLimit:float|None=None, valLossLimit:float|None=None,
+        verbose:bool=True)->list[tuple[Results, Results]]:
+    history: list[tuple[Results, Results]] = []
+    ptime = time.perf_counter
+    tStart = ptime()
     assert nbEpoches > 0
     for epoch in range(nbEpoches):
         running_loss = 0.0
         running_accuracy = 0.0
         nbDone: int = 0
         line = SingleLinePrinter(None)
+        tLastLog: float = tStart
         for stepIndex, (inputs, awnsers, idx) in enumerate(
                 iterInputAndLabels(train_dataloader, device)):
-            line.print(f"finished: {stepIndex:_d}/{len(train_dataloader):_d} ({stepIndex/len(train_dataloader):.4%})")
+            if (verbose is True) and (nbDone != 0) \
+                    and ((ptime() - tLastLog) > 0.05):
+                tLastLog = ptime()
+                line.print(f"finished: {stepIndex:_d}/{len(train_dataloader):_d} "
+                           f"({stepIndex/len(train_dataloader):.4%}) "
+                           f"runningLoss: {running_loss/stepIndex:.4g}, "
+                           f"runningAcc: {running_accuracy/nbDone:.2%}")
             model.train(True)
             optimizer.zero_grad()
             outputs: torch.Tensor = model(inputs)
@@ -53,12 +62,17 @@ def train_model(
         testResults = eval_model(
             model, device, criterion,
             test_dataloader, verbose=False)
-        line.clearLine()
         meanLoss = (running_loss / len(train_dataloader))
         meanAccuracy = (running_accuracy / nbDone)
         history.append((Results(loss=meanLoss, accuracy=meanAccuracy), testResults))
-        print(f'Epoch {epoch+1}, train: {history[-1][0]}, test: {testResults}')
-    return history[-1][0]
+        if verbose is True:
+            line.clearLine()
+            print(f'Epoch {epoch+1}, train: {history[-1][0]}, test: {testResults}')
+        if (timeLimit is not None) and (ptime() - tStart) > timeLimit:
+            break
+        if (valLossLimit is not None) and (testResults.loss < valLossLimit):
+            break
+    return history
 
 def eval_model(
         model:nn.Module, device:torch.device, criterion:"_Criterion",
@@ -169,13 +183,47 @@ class DenseModelsGeneric(nn.Module):
         self.loss: _Criterion = criterion
 
     def forward(self, x: torch.Tensor)->torch.Tensor:
-        if False:
-            print(x.shape)
-            for layer in self._layers:
-                x = layer(x)
-                print(x.shape, "<-", layer)
-            return x
         return self._layers(x)
     
     def __call__(self, x:torch.Tensor) -> torch.Tensor:
         return super().__call__(x)
+
+    def countParameters(self)->int:
+        return sum(int(numpy.prod(params.size())) 
+                   for params in self._layers.parameters())
+
+class DenseSkipedModelsGeneric(nn.Module):
+    def __init__(self, layers: list[tuple[int, int, _Activ]], 
+                 optim:type[torch.optim.Optimizer], lr:float,
+                 criterion:"_Criterion"):
+        super().__init__()
+        self._layers: list[tuple[nn.Module, nn.Module]] = []
+        for i, (d1, d2, activ) in enumerate(layers):
+            lin = nn.Linear(d1, d2)
+            act = getActiv(activ)
+            self.add_module(f"Linear({i})", lin)
+            self.add_module(f"{act._get_name()}({i})", act)
+            self._layers.append((lin, act))
+
+        self.optim = optim(self.getModelParams(), lr=0.001) # type: ignore
+        self.loss: _Criterion = criterion
+
+    def forward(self, x: torch.Tensor)->torch.Tensor:
+        for layers in self._layers:
+            x_out = layers[1](layers[0](x))
+            if x_out.shape == x.shape:
+                x = x + x_out
+            else: x = x_out
+        return x
+    
+    def __call__(self, x:torch.Tensor) -> torch.Tensor:
+        return super().__call__(x)
+    
+    def getModelParams(self):
+        for grp in self._layers:
+            for layer in grp:
+                yield from layer.parameters()
+    
+    def countParameters(self)->int:
+        return sum(int(numpy.prod(param.size()))
+                   for param in self.getModelParams())
